@@ -1,9 +1,17 @@
-// src/index.ts — DEBUG version
+// src/index.ts
+// name: AppleEmojis
+// vendor: Vendetta / Bunny / Revenge
+// approach: hooks React.createElement at the module level. Text in modern
+//           Discord is a functional component, so prototype.render patching
+//           doesn't work anymore. createElement catches every Text render.
+
 import { React, ReactNative } from "@vendetta/metro/common";
+import { findByProps } from "@vendetta/metro";
 import { logger } from "@vendetta";
 import { storage } from "@vendetta/plugin";
 import Settings from "./Settings";
 
+// ── emoji detection ─────────────────────────────────────────────────────────
 const EMOJI_CHAR =
   "(?:\\u00a9|\\u00ae|[\\u2000-\\u3300]|\\ud83c[\\ud000-\\udfff]|\\ud83d[\\ud000-\\udfff]|\\ud83e[\\ud000-\\udfff])";
 const EMOJI_RE = new RegExp(
@@ -29,6 +37,7 @@ function EmojiImage(props: { emoji: string; size: number }) {
   });
 }
 
+// ── helpers ─────────────────────────────────────────────────────────────────
 function fontSizeOf(style: any): number {
   if (!style) return 22;
   const flat = Array.isArray(style)
@@ -62,6 +71,7 @@ function transformString(str: string, size: number): any {
 
 function walk(node: any, size: number): any {
   if (typeof node === "string") return transformString(node, size);
+
   if (Array.isArray(node)) {
     const out: any[] = [];
     for (let i = 0; i < node.length; i++) {
@@ -79,6 +89,7 @@ function walk(node: any, size: number): any {
     }
     return out;
   }
+
   if (React.isValidElement(node)) {
     const kids = (node.props as any)?.children;
     if (kids == null) return node;
@@ -86,77 +97,89 @@ function walk(node: any, size: number): any {
     if (newKids === kids) return node;
     return React.cloneElement(node, {}, newKids);
   }
+
   return node;
 }
 
+// ── patch: React.createElement ──────────────────────────────────────────────
 let unpatch: (() => void) | null = null;
-let renderCount = 0;
-let hitCount = 0;
 
-function patchText() {
-  const Text: any = (ReactNative as any).Text;
-  const proto = Text?.prototype;
+function patch() {
+  // find the React module that Discord itself uses
+  const reactModule: any =
+    findByProps("createElement", "cloneElement", "isValidElement") ||
+    findByProps("createElement", "Fragment");
 
-  logger.log(
-    "[AppleEmojis] patch target — Text:",
-    !!Text,
-    "proto:",
-    !!proto,
-    "render:",
-    typeof proto?.render
-  );
+  if (!reactModule || typeof reactModule.createElement !== "function") {
+    logger.error(
+      "[AppleEmojis] couldn't locate React module via findByProps — falling back to metro import"
+    );
+    return tryFallback();
+  }
 
-  if (!proto || typeof proto.render !== "function") {
-    logger.error("[AppleEmojis] Text.render not found, aborting patch");
+  // identify the Text component reference
+  const TextComp: any = (ReactNative as any)?.Text;
+  if (!TextComp) {
+    logger.error("[AppleEmojis] ReactNative.Text missing");
     return;
   }
 
-  const original = proto.render;
+  logger.log("[AppleEmojis] patching React.createElement; Text ref present");
 
-  proto.render = function () {
-    renderCount++;
-    const ret = original.call(this);
-    if (!storage.enabled || !React.isValidElement(ret)) return ret;
+  const origCE = reactModule.createElement;
+  let hits = 0;
+  let passes = 0;
 
-    const size = Math.round(fontSizeOf((this.props as any)?.style) * 1.25);
-
-    try {
-      const kids = (ret.props as any)?.children;
-      if (kids == null) return ret;
-
-      // log first few string children so we can see what's flowing through
-      if (renderCount < 20) {
-        logger.log(
-          "[AppleEmojis] render #" + renderCount + " children type:",
-          typeof kids,
-          "sample:",
-          typeof kids === "string" ? kids.slice(0, 40) : "(not string)"
-        );
+  reactModule.createElement = function (type: any, props: any, ...children: any[]) {
+    passes++;
+    if (type === TextComp && storage.enabled) {
+      const size = Math.round(
+        fontSizeOf(props?.style) * 1.25
+      );
+      const newChildren = children.map((c) => walk(c, size));
+      const ret = origCE.call(this, type, props, ...newChildren);
+      if (children.some((c, i) => newChildren[i] !== c)) {
+        hits++;
+        if (hits <= 5) logger.log("[AppleEmojis] HIT createElement #" + hits);
       }
-
-      const newKids = walk(kids, size);
-      if (newKids !== kids) {
-        hitCount++;
-        if (hitCount < 10) logger.log("[AppleEmojis] HIT — emoji swapped");
-      }
-      if (newKids === kids) return ret;
-      return React.cloneElement(ret, {}, newKids);
-    } catch (e) {
-      logger.error("[AppleEmojis] transform failed", e);
       return ret;
     }
+    return origCE.apply(this, arguments as any);
   };
+
+  if (passes >= 0) logger.log("[AppleEmojis] patch installed");
 
   unpatch = () => {
-    proto.render = original;
+    reactModule.createElement = origCE;
   };
-
-  logger.log("[AppleEmojis] patch applied");
 }
 
+function tryFallback() {
+  const proto = (ReactNative as any)?.Text?.prototype;
+  if (!proto || typeof proto.render !== "function") {
+    logger.error("[AppleEmojis] no patchable target found");
+    return;
+  }
+  logger.log("[AppleEmojis] using prototype.render fallback");
+  const orig = proto.render;
+  proto.render = function () {
+    const ret = orig.call(this);
+    if (!storage.enabled || !React.isValidElement(ret)) return ret;
+    const size = Math.round(fontSizeOf((this.props as any)?.style) * 1.25);
+    const kids = (ret.props as any)?.children;
+    if (kids == null) return ret;
+    const nk = walk(kids, size);
+    return nk === kids ? ret : React.cloneElement(ret, {}, nk);
+  };
+  unpatch = () => {
+    proto.render = orig;
+  };
+}
+
+// ── lifecycle ───────────────────────────────────────────────────────────────
 export function onLoad() {
   if (storage.enabled === undefined) storage.enabled = true;
-  patchText();
+  patch();
   logger.log("[AppleEmojis] loaded");
 }
 
