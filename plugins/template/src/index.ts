@@ -1,15 +1,9 @@
-// src/index.ts
-// name: AppleEmojis
-// vendor: Vendetta / Bunny
-// what: patches ReactNative.Text.render to swap unicode emoji for Apple
-//       emoji PNGs. image set: iamcal/emoji-data img-apple-160 via jsDelivr.
-
+// src/index.ts — DEBUG version
 import { React, ReactNative } from "@vendetta/metro/common";
 import { logger } from "@vendetta";
 import { storage } from "@vendetta/plugin";
 import Settings from "./Settings";
 
-// ── emoji detection ─────────────────────────────────────────────────────────
 const EMOJI_CHAR =
   "(?:\\u00a9|\\u00ae|[\\u2000-\\u3300]|\\ud83c[\\ud000-\\udfff]|\\ud83d[\\ud000-\\udfff]|\\ud83e[\\ud000-\\udfff])";
 const EMOJI_RE = new RegExp(
@@ -17,7 +11,6 @@ const EMOJI_RE = new RegExp(
   "g"
 );
 
-// ── image source ────────────────────────────────────────────────────────────
 const CDN =
   "https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/img-apple-160";
 
@@ -28,20 +21,14 @@ function emojiToCodepoint(emoji: string): string {
     .join("-");
 }
 
-// ── the replacement node ────────────────────────────────────────────────────
 function EmojiImage(props: { emoji: string; size: number }) {
   return React.createElement(ReactNative.Image, {
     source: { uri: `${CDN}/${emojiToCodepoint(props.emoji)}.png` },
-    style: {
-      width: props.size,
-      height: props.size,
-      marginHorizontal: 1,
-    },
+    style: { width: props.size, height: props.size, marginHorizontal: 1 },
     resizeMode: "contain",
   });
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
 function fontSizeOf(style: any): number {
   if (!style) return 22;
   const flat = Array.isArray(style)
@@ -58,7 +45,6 @@ function transformString(str: string, size: number): any {
   const out: any[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-
   while ((m = EMOJI_RE.exec(str))) {
     if (m.index > last) out.push(str.slice(last, m.index));
     out.push(
@@ -76,7 +62,6 @@ function transformString(str: string, size: number): any {
 
 function walk(node: any, size: number): any {
   if (typeof node === "string") return transformString(node, size);
-
   if (Array.isArray(node)) {
     const out: any[] = [];
     for (let i = 0; i < node.length; i++) {
@@ -90,13 +75,10 @@ function walk(node: any, size: number): any {
               : x
           );
         }
-      } else {
-        out.push(r);
-      }
+      } else out.push(r);
     }
     return out;
   }
-
   if (React.isValidElement(node)) {
     const kids = (node.props as any)?.children;
     if (kids == null) return node;
@@ -104,27 +86,35 @@ function walk(node: any, size: number): any {
     if (newKids === kids) return node;
     return React.cloneElement(node, {}, newKids);
   }
-
   return node;
 }
 
-// ── patch ───────────────────────────────────────────────────────────────────
 let unpatch: (() => void) | null = null;
+let renderCount = 0;
+let hitCount = 0;
 
 function patchText() {
   const Text: any = (ReactNative as any).Text;
   const proto = Text?.prototype;
 
+  logger.log(
+    "[AppleEmojis] patch target — Text:",
+    !!Text,
+    "proto:",
+    !!proto,
+    "render:",
+    typeof proto?.render
+  );
+
   if (!proto || typeof proto.render !== "function") {
-    logger.error(
-      "[AppleEmojis] ReactNative.Text.render not found — RN version may have changed Text internals"
-    );
+    logger.error("[AppleEmojis] Text.render not found, aborting patch");
     return;
   }
 
   const original = proto.render;
 
   proto.render = function () {
+    renderCount++;
     const ret = original.call(this);
     if (!storage.enabled || !React.isValidElement(ret)) return ret;
 
@@ -133,7 +123,22 @@ function patchText() {
     try {
       const kids = (ret.props as any)?.children;
       if (kids == null) return ret;
+
+      // log first few string children so we can see what's flowing through
+      if (renderCount < 20) {
+        logger.log(
+          "[AppleEmojis] render #" + renderCount + " children type:",
+          typeof kids,
+          "sample:",
+          typeof kids === "string" ? kids.slice(0, 40) : "(not string)"
+        );
+      }
+
       const newKids = walk(kids, size);
+      if (newKids !== kids) {
+        hitCount++;
+        if (hitCount < 10) logger.log("[AppleEmojis] HIT — emoji swapped");
+      }
       if (newKids === kids) return ret;
       return React.cloneElement(ret, {}, newKids);
     } catch (e) {
@@ -145,9 +150,10 @@ function patchText() {
   unpatch = () => {
     proto.render = original;
   };
+
+  logger.log("[AppleEmojis] patch applied");
 }
 
-// ── lifecycle ───────────────────────────────────────────────────────────────
 export function onLoad() {
   if (storage.enabled === undefined) storage.enabled = true;
   patchText();
